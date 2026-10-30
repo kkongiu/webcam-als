@@ -1,0 +1,16 @@
+[Unit]
+Description=Automatic screen brightness from the webcam
+Documentation=https://github.com/kkongiu/webcam-als
+After=graphical-session.target plasma-kwin_wayland.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/webcam-als
+Restart=on-failure
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""
+webcam-als - automatic screen brightness driven by a webcam light sensor.
+
+Laptops without an ambient light sensor (ALS) can still adapt screen
+brightness to the environment: the webcam is used as a light meter. Auto
+exposure is locked for a single shot, the mean luma is measured and auto
+exposure is restored right away. Brightness is then adjusted relative to a
+user-chosen BASE value: full base in bright light, reduced by a configurable
+percentage in the dark.
+
+Config:  ~/.config/webcam-als/config.json
+State:   ~/.local/state/webcam-als/state.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------- settings
+
+DEVICE = "/dev/video0"
+WIDTH, HEIGHT = 320, 180
+FRAMES_PER_SHOT = 4
+
+LADDER = (156, 400, 1250)          # UVC exposure values (100 us units)
+NORM = {156: 2.12, 400: 1.00, 1250: 0.48}
+LADDER_START = 1
+
+DEFAULT_CONFIG = {
+    "interval_ac": 10,             # seconds between samples on AC power
+    "interval_battery": 30,        # seconds between samples on battery
+    "base_pct": 70,                # brightness in bright light (%)
+    "max_reduction_pct": 55,       # maximum reduction in the dark, relative to base
+    "floor_pct": 10,               # never go below this (%)
+    "alpha": 0.25,                 # smoothing factor
+    "max_step": 15.0,              # maximum change per cycle (percentage points)
+    "deadband": 2.0,               # hysteresis (percentage points)
+}
+
+DARK_REF = 2.0                     # normalized light -> dark (before calibration)
+BRIGHT_REF = 80.0                  # normalized light -> bright
+
+HISTORY_MAX = 240
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "webcam-als"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "webcam-als"
+STATE_FILE = STATE_DIR / "state.json"
+LOG_FILE = STATE_DIR / "webcam-als.log"
+PID_FILE = STATE_DIR / "daemon.pid"
+
+PLASMA_SERVICE = "org.kde.ScreenBrightness"
+PLASMA_IFACE = "org.kde.ScreenBrightness.Display"
+PLASMA_ROOT = "/org/kde/ScreenBrightness"
+
+STOP = False
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def log(msg: str) -> None:
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 200_000:
+            LOG_FILE.unlink()
+        with LOG_FILE.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def run(cmd: list[str], timeout: float = 25) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+
+def load_config() -> dict:
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    return {**DEFAULT_CONFIG, **data}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    tmp.replace(CONFIG_FILE)
+
+
+def backlight_dir() -> Path | None:
+    base = Path("/sys/class/backlight")
+    try:
+        for entry in sorted(base.iterdir()):
+            if (entry / "brightness").exists():
+                return entry
+    except OSError:
+        pass
+    return None
+
+
+def camera_busy() -> bool:
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}") == DEVICE:
+                        return int(pid) != os.getpid()
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return False
+
+
+def on_battery() -> bool:
+    try:
+        return (Path("/sys/class/power_supply/AC/online").read_text().strip() == "0")
+    except OSError:
+        return False
+
+
+def session_idle() -> bool:
+    proc = run([
+        "busctl", "get-property", "org.freedesktop.login1",
+        "/org/freedesktop/login1/session/auto", "org.freedesktop.login1.Session", "IdleHint",
+    ])
+    return proc.stdout.decode(errors="replace").strip().endswith("true")
+
+
+# ---------------------------------------------------------------- light meter
+
+
+def set_exposure(exposure: int | None) -> None:
+    if exposure is None:
+        run(["v4l2-ctl", "-d", DEVICE, "--set-ctrl=auto_exposure=3"])
+        return
+    run(["v4l2-ctl", "-d", DEVICE, "--set-ctrl=auto_exposure=1"])
+    run(["v4l2-ctl", "-d", DEVICE, f"--set-ctrl=exposure_time_absolute={exposure}"])
+
+
+def pgm_frames(data: bytes) -> list[tuple[int, int, float]]:
+    frames: list[tuple[int, int, float]] = []
+    i = 0
+    while i < len(data):
+        if data[i:i + 2] != b"P5":
+            break
+        j = data.index(b"\n", i)
+        k = data.index(b"\n", j + 1)
+        m = data.index(b"\n", k + 1)
+        width, height = (int(x) for x in data[j + 1:k].split())
+        size = width * height
+        pixels = data[m + 1:m + 1 + size]
+        frames.append((width, height, sum(pixels) / size))
+        i = m + 1 + size
+    return frames
+
+
+def grab_luma(exposure: int) -> float:
+    proc = run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "v4l2", "-video_size", f"{WIDTH}x{HEIGHT}", "-i", DEVICE,
+        "-frames:v", str(FRAMES_PER_SHOT),
+        "-f", "image2pipe", "-vcodec", "pgm", "-",
+    ])
+    if proc.returncode != 0 or not proc.stdout:
+        raise RuntimeError(f"capture failed: {proc.stderr.decode(errors='replace').strip()[:200]}")
+    frames = pgm_frames(proc.stdout)
+    if not frames:
+        raise RuntimeError("no frame received")
+    return frames[-1][2]
+
+
+def measure_light() -> float:
+    exposure = LADDER[LADDER_START]
+    luma = grab_luma(exposure)
+    if luma > 90 and exposure != LADDER[0]:
+        exposure = LADDER[0]
+        luma = grab_luma(exposure)
+    elif luma < 12 and exposure != LADDER[-1]:
+        exposure = LADDER[-1]
+        luma = grab_luma(exposure)
+    return luma * NORM[exposure]
+
+
+def sample() -> float:
+    """Measure ambient light and always restore auto exposure."""
+    if camera_busy():
+        raise RuntimeError("webcam is in use by another program")
+    set_exposure(LADDER[LADDER_START])
+    try:
+        return measure_light()
+    finally:
+        set_exposure(None)
+
+
+# ---------------------------------------------------------------- state
+
+
+def load_state() -> dict:
+    default = {"history": [], "pct": None, "applied": None, "light": None, "time": None}
+    try:
+        return {**default, **json.loads(STATE_FILE.read_text())}
+    except (OSError, ValueError):
+        return default
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
+
+
+def light_range(state: dict) -> tuple[float, float]:
+    history = [x for x in state.get("history", []) if x > 0]
+    if len(history) >= 30:
+        q = statistics.quantiles(history, n=20)
+        lo, hi = q[0], q[-1]
+        if hi / max(lo, 0.1) >= 3:
+            return max(lo * 0.8, 0.2), hi * 1.2
+    return DARK_REF, BRIGHT_REF
+
+
+def target_pct(light: float, lo: float, hi: float, cfg: dict) -> float:
+    """Light -> brightness: base in bright light, reduced base in the dark."""
+    t = (math.log(max(light, 0.05)) - math.log(lo)) / (math.log(hi) - math.log(lo))
+    t = min(max(t, 0.0), 1.0)
+    reduction = cfg["max_reduction_pct"] * (1.0 - t)
+    value = cfg["base_pct"] * (1.0 - reduction / 100.0)
+    return max(value, cfg["floor_pct"])
+
+
+# ---------------------------------------------------------------- brightness
+
+
+def plasma_available() -> bool:
+    return run(["busctl", "--user", "status", PLASMA_SERVICE]).returncode == 0
+
+
+def plasma_display_path() -> str:
+    proc = run([
+        "busctl", "--user", "get-property", PLASMA_SERVICE, PLASMA_ROOT,
+        "org.kde.ScreenBrightness", "DisplaysDBusNames",
+    ])
+    try:
+        name = proc.stdout.decode(errors="replace").split('"')[1]
+        return f"{PLASMA_ROOT}/{name}"
+    except IndexError:
+        return f"{PLASMA_ROOT}/display0"
+
+
+def plasma_max() -> int:
+    proc = run([
+        "busctl", "--user", "get-property", PLASMA_SERVICE,
+        plasma_display_path(), PLASMA_IFACE, "MaxBrightness",
+    ])
+    try:
+        return int(proc.stdout.split()[-1])
+    except (IndexError, ValueError):
+        return 10000
+
+
+def current_brightness_pct() -> float | None:
+    proc = run([
+        "busctl", "--user", "get-property", PLASMA_SERVICE,
+        plasma_display_path(), PLASMA_IFACE, "Brightness",
+    ])
+    if proc.returncode == 0:
+        try:
+            return int(proc.stdout.split()[-1]) / plasma_max() * 100.0
+        except (IndexError, ValueError):
+            pass
+    backlight = backlight_dir()
+    if backlight is None:
+        return None
+    try:
+        raw = int((backlight / "brightness").read_text().strip())
+        top = int((backlight / "max_brightness").read_text().strip())
+        return raw / top * 100.0
+    except (OSError, ValueError):
+        return None
+
+
+def apply_brightness(pct: float) -> bool:
+    pct = min(max(pct, 1.0), 100.0)
+    if plasma_available():
+        value = round(plasma_max() * pct / 100.0)
+        # flags 0x1 = SuppressIndicator: no on-screen OSD for automatic changes
+        proc = run([
+            "busctl", "--user", "call", PLASMA_SERVICE, plasma_display_path(),
+            PLASMA_IFACE, "SetBrightnessWithContext", "ius",
+            str(value), "1", "webcam-als",
+        ])
+        if proc.returncode == 0:
+            return True
+        log(f"Plasma SetBrightness failed: {proc.stderr.decode(errors='replace').strip()}")
+
+    backlight = backlight_dir()
+    if backlight is None:
+        log("no backlight device found")
+        return False
+    try:
+        max_raw = int((backlight / "max_brightness").read_text().strip())
+        value = round(max_raw * pct / 100.0)
+        proc = run([
+            "busctl", "call", "org.freedesktop.login1",
+            "/org/freedesktop/login1/session/auto", "org.freedesktop.login1.Session",
+            "SetBrightness", "ssu", "backlight", backlight.name, str(value),
+        ])
+        return proc.returncode == 0
+    except (OSError, ValueError) as exc:
+        log(f"brightness not applicable: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------- cycle
+
+
+def cycle(state: dict, cfg: dict) -> dict:
+    light = sample()
+
+    history = state.setdefault("history", [])
+    history.append(round(light, 3))
+    del history[:-HISTORY_MAX]
+
+    lo, hi = light_range(state)
+    target = target_pct(light, lo, hi, cfg)
+
+    # when the user changes the base, jump to the new value instead of chasing it
+    if state.get("base") != cfg["base_pct"]:
+        state["pct"] = None
+    state["base"] = cfg["base_pct"]
+
+    current = state.get("pct")
+    if current is None:
+        current = target
+    else:
+        delta = target - current
+        if abs(delta) < cfg["deadband"]:
+            target = current
+        else:
+            step = min(max(delta * cfg["alpha"], -cfg["max_step"]), cfg["max_step"])
+            target = current + step
+
+    state["pct"] = round(target, 1)
+    state["light"] = round(light, 2)
+    state["time"] = time.time()
+    state["lo"], state["hi"] = round(lo, 2), round(hi, 2)
+
+    log(f"light {light:6.2f} (range {lo:.1f}-{hi:.1f}) -> {target:5.1f}% (base {cfg['base_pct']}%)")
+
+    if abs(target - (state.get("applied") or -1)) >= 0.5:
+        if apply_brightness(target):
+            state["applied"] = state["pct"]
+
+    save_state(state)
+    return state
+
+
+def status_dict(state: dict, cfg: dict) -> dict:
+    lo, hi = light_range(state)
+    light = state.get("light")
+    return {
+        "light": light,
+        "lo": lo,
+        "hi": hi,
+        "target": target_pct(light, lo, hi, cfg) if light is not None else None,
+        "current": current_brightness_pct(),
+        "base_pct": cfg["base_pct"],
+        "max_reduction_pct": cfg["max_reduction_pct"],
+        "floor_pct": cfg["floor_pct"],
+        "interval_ac": cfg["interval_ac"],
+        "interval_battery": cfg["interval_battery"],
+        "last_sample": state.get("time"),
+        "samples": len(state.get("history", [])),
+        "running": daemon_running(),
+    }
+
+
+def daemon_running() -> bool:
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def write_pid() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def clear_pid() -> None:
+    try:
+        if PID_FILE.read_text().strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def handle_stop(signum, frame) -> None:
+    global STOP
+    STOP = True
+
+
+# ---------------------------------------------------------------- main
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Automatic screen brightness from a webcam")
+    parser.add_argument("--status", action="store_true", help="measure and show, without applying")
+    parser.add_argument("--json", action="store_true", help="JSON output (with --status)")
+    parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    parser.add_argument("--reset", action="store_true", help="forget the learned calibration")
+    parser.add_argument("--apply", type=float, metavar="PCT", help="set brightness immediately")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    state = load_state()
+
+    if args.apply is not None:
+        ok = apply_brightness(args.apply)
+        if ok:
+            state["applied"] = round(args.apply, 1)
+            state["pct"] = round(args.apply, 1)
+            save_state(state)
+        return 0 if ok else 1
+
+    if args.reset:
+        save_state({"history": [], "pct": None, "applied": None, "light": None, "time": None})
+        if not args.json:
+            print("calibration reset")
+        return 0
+
+    if args.status:
+        error = None
+        try:
+            light = sample()
+            state["light"] = round(light, 2)
+            state["time"] = time.time()
+            save_state(state)
+        except RuntimeError as exc:
+            error = str(exc)
+
+        info = status_dict(state, cfg)
+        if error:
+            info["error"] = error
+        if args.json:
+            print(json.dumps(info))
+        else:
+            if error:
+                print(f"error: {error}")
+            elif info["light"] is None:
+                print("no measurement available")
+            else:
+                print(f"light: {info['light']:.2f}  (range {info['lo']:.1f}-{info['hi']:.1f})")
+                print(f"recommended brightness: {info['target']:.0f}%  (base {info['base_pct']}%)")
+        return 0 if error is None else 1
+
+    if args.once:
+        try:
+            cycle(state, cfg)
+        except RuntimeError as exc:
+            log(f"error: {exc}")
+            return 1
+        return 0
+
+    # daemon
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+    write_pid()
+    log(f"start: interval {cfg['interval_ac']}s (AC) / {cfg['interval_battery']}s (battery)")
+    try:
+        while not STOP:
+            cfg = load_config()          # changes made in the GUI apply immediately
+            state = load_state()
+            interval = cfg["interval_battery"] if on_battery() else cfg["interval_ac"]
+            if session_idle():
+                time.sleep(interval)
+                continue
+            try:
+                cycle(state, cfg)
+            except Exception as exc:
+                log(f"error: {exc}")
+            for _ in range(int(interval * 10)):
+                if STOP:
+                    break
+                time.sleep(0.1)
+    finally:
+        clear_pid()
+        log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

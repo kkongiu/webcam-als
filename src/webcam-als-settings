@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""
+webcam-als-settings - pannello di controllo per la luminosita' automatica.
+
+Permette di scegliere la luminosita' base, la riduzione massima al buio,
+gli intervalli di campionamento e di attivare/disattivare il servizio.
+Scrive la configurazione in ~/.config/webcam-als/config.json, letta dal
+demone webcam-als ad ogni ciclo.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QStyleFactory,
+    QVBoxLayout,
+    QWidget,
+)
+
+def find_script() -> Path:
+    """Locate the webcam-als engine next to this file or in the usual bin dirs."""
+    candidates = [
+        Path(__file__).resolve().with_name("webcam-als"),
+        Path.home() / ".local/bin/webcam-als",
+        Path("/usr/local/bin/webcam-als"),
+        Path("/usr/bin/webcam-als"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path("webcam-als")
+
+
+SCRIPT = find_script()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "webcam-als"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "webcam-als"
+STATE_FILE = STATE_DIR / "state.json"
+PID_FILE = STATE_DIR / "daemon.pid"
+AUTOSTART = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart" / "webcam-als.desktop"
+
+DEFAULTS = {
+    "interval_ac": 10,
+    "interval_battery": 30,
+    "base_pct": 70,
+    "max_reduction_pct": 55,
+    "floor_pct": 10,
+}
+
+
+# ---------------------------------------------------------------- file
+
+
+def load_config() -> dict:
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    return {**DEFAULTS, **data}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    tmp.replace(CONFIG_FILE)
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def daemon_pid() -> int | None:
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def autostart_enabled() -> bool:
+    return AUTOSTART.exists()
+
+
+def set_autostart(enabled: bool) -> None:
+    if enabled:
+        AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+        AUTOSTART.write_text(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Luminosità automatica (webcam)\n"
+            "Comment=Regola la luminosità dello schermo in base alla luce ambientale\n"
+            f"Exec={SCRIPT}\n"
+            "Terminal=false\n"
+            "X-KDE-autostart-after=panel\n"
+            "OnlyShowIn=KDE;\n"
+        )
+    else:
+        try:
+            AUTOSTART.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- finestra
+
+
+class App(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cfg = load_config()
+        self._measure_proc: QProcess | None = None
+
+        self.setWindowTitle("Luminosità automatica")
+        self.setWindowIcon(QIcon.fromTheme("video-display"))
+        self.setMinimumWidth(460)
+
+        self._build_ui()
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(250)
+        self._save_timer.timeout.connect(self._save)
+
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setSingleShot(True)
+        self._apply_timer.setInterval(350)
+        self._apply_timer.timeout.connect(self._apply_base)
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(2000)
+        self._poll_timer.timeout.connect(self._poll)
+        self._poll_timer.start()
+
+        self._poll()
+        self._sync_labels()
+
+    # ------------------------------------------------------------ costruzione
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        # ---- stato
+        status = QGroupBox("Stato")
+        grid = QGridLayout(status)
+        grid.setColumnStretch(1, 1)
+
+        self.light_value = QLabel("—")
+        self.target_value = QLabel("—")
+        self.current_value = QLabel("—")
+        self.updated_value = QLabel("nessun campionamento")
+
+        for row, (title, widget) in enumerate(
+            [
+                ("Luce ambientale", self.light_value),
+                ("Luminosità consigliata", self.target_value),
+                ("Luminosità attuale", self.current_value),
+            ]
+        ):
+            grid.addWidget(QLabel(title), row, 0)
+            widget.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            font = widget.font()
+            font.setBold(True)
+            widget.setFont(font)
+            grid.addWidget(widget, row, 1)
+
+        self.updated_value.setEnabled(False)
+        grid.addWidget(self.updated_value, 3, 0, 1, 2)
+        root.addWidget(status)
+
+        # ---- luminosita'
+        bright = QGroupBox("Luminosità")
+        form = QFormLayout(bright)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.base_slider = QSlider(Qt.Horizontal)
+        self.base_slider.setRange(10, 100)
+        self.base_slider.setValue(int(self.cfg["base_pct"]))
+        self.base_slider.setToolTip(
+            "Luminosità usata quando c'è molta luce.\nAl buio viene ridotta secondo il valore qui sotto."
+        )
+        self.base_label = QLabel(f"{self.base_slider.value()}%")
+        self.base_label.setMinimumWidth(42)
+        self.base_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.base_slider.valueChanged.connect(self._on_base_changed)
+        row = QHBoxLayout()
+        row.addWidget(self.base_slider, 1)
+        row.addWidget(self.base_label)
+        form.addRow("Base (piena luce)", row)
+
+        self.reduction_slider = QSlider(Qt.Horizontal)
+        self.reduction_slider.setRange(0, 75)
+        self.reduction_slider.setValue(int(self.cfg["max_reduction_pct"]))
+        self.reduction_slider.setToolTip("Di quanto ridurre la base quando la stanza è buia.")
+        self.reduction_label = QLabel(f"-{self.reduction_slider.value()}%")
+        self.reduction_label.setMinimumWidth(42)
+        self.reduction_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.reduction_slider.valueChanged.connect(self._on_reduction_changed)
+        row = QHBoxLayout()
+        row.addWidget(self.reduction_slider, 1)
+        row.addWidget(self.reduction_label)
+        form.addRow("Riduzione al buio", row)
+
+        self.floor_spin = QSpinBox()
+        self.floor_spin.setRange(5, 50)
+        self.floor_spin.setSuffix("%")
+        self.floor_spin.setValue(int(self.cfg["floor_pct"]))
+        self.floor_spin.setToolTip("Luminosità minima assoluta, mai superata verso il basso.")
+        self.floor_spin.valueChanged.connect(self._schedule_save)
+        form.addRow("Minimo assoluto", self.floor_spin)
+        root.addWidget(bright)
+
+        # ---- campionamento
+        sampling = QGroupBox("Campionamento")
+        form2 = QFormLayout(sampling)
+        form2.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.interval_ac = QSpinBox()
+        self.interval_ac.setRange(2, 120)
+        self.interval_ac.setSuffix(" s")
+        self.interval_ac.setValue(int(self.cfg["interval_ac"]))
+        self.interval_ac.valueChanged.connect(self._schedule_save)
+        form2.addRow("Intervallo con alimentatore", self.interval_ac)
+
+        self.interval_battery = QSpinBox()
+        self.interval_battery.setRange(5, 300)
+        self.interval_battery.setSuffix(" s")
+        self.interval_battery.setValue(int(self.cfg["interval_battery"]))
+        self.interval_battery.valueChanged.connect(self._schedule_save)
+        form2.addRow("Intervallo a batteria", self.interval_battery)
+        root.addWidget(sampling)
+
+        # ---- attivazione
+        activation = QGroupBox("Attivazione")
+        box = QVBoxLayout(activation)
+        self.active_check = QCheckBox("Attiva ora")
+        self.active_check.setToolTip("Avvia o ferma il demone che regola la luminosità.")
+        self.active_check.toggled.connect(self._toggle_daemon)
+        box.addWidget(self.active_check)
+
+        self.autostart_check = QCheckBox("Avvia automaticamente all'accesso")
+        self.autostart_check.setToolTip("Crea un avvio automatico nella sessione KDE.")
+        self.autostart_check.toggled.connect(self._toggle_autostart)
+        box.addWidget(self.autostart_check)
+        root.addWidget(activation)
+
+        # ---- pulsanti
+        buttons = QHBoxLayout()
+        self.measure_button = QPushButton("Misura ora")
+        self.measure_button.clicked.connect(self._measure_now)
+        buttons.addWidget(self.measure_button)
+
+        reset_button = QPushButton("Ricalibra")
+        reset_button.setToolTip("Dimentica gli estremi di luce appresi finora.")
+        reset_button.clicked.connect(self._reset_calibration)
+        buttons.addWidget(reset_button)
+
+        buttons.addStretch(1)
+        close_button = QPushButton("Chiudi")
+        close_button.clicked.connect(self.close)
+        buttons.addWidget(close_button)
+        root.addLayout(buttons)
+
+        self.autostart_check.blockSignals(True)
+        self.autostart_check.setChecked(autostart_enabled())
+        self.autostart_check.blockSignals(False)
+
+    # ------------------------------------------------------------ eventi
+
+    def _on_base_changed(self, value: int) -> None:
+        self.base_label.setText(f"{value}%")
+        self._schedule_save()
+        self._apply_timer.start()   # applica dopo una breve pausa, per non spammare D-Bus
+
+    def _on_reduction_changed(self, value: int) -> None:
+        self.reduction_label.setText(f"-{value}%")
+        self._schedule_save()
+
+    def _schedule_save(self) -> None:
+        self._save_timer.start()
+
+    def _save(self) -> None:
+        self.cfg.update({
+            "base_pct": self.base_slider.value(),
+            "max_reduction_pct": self.reduction_slider.value(),
+            "floor_pct": self.floor_spin.value(),
+            "interval_ac": self.interval_ac.value(),
+            "interval_battery": self.interval_battery.value(),
+        })
+        save_config(self.cfg)
+
+    def _apply_base(self) -> None:
+        QProcess.startDetached(str(SCRIPT), ["--apply", str(self.base_slider.value())])
+
+    def _toggle_daemon(self, enabled: bool) -> None:
+        if enabled:
+            if daemon_pid() is None:
+                subprocess.Popen(
+                    [str(SCRIPT)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            QTimer.singleShot(1200, self._sync_active)
+        else:
+            pid = daemon_pid()
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            QTimer.singleShot(600, self._sync_active)
+
+    def _sync_active(self) -> None:
+        running = daemon_pid() is not None
+        self.active_check.blockSignals(True)
+        self.active_check.setChecked(running)
+        self.active_check.blockSignals(False)
+
+    def _toggle_autostart(self, enabled: bool) -> None:
+        set_autostart(enabled)
+
+    def _measure_now(self) -> None:
+        if self._measure_proc is not None and self._measure_proc.state() != QProcess.NotRunning:
+            return
+        self.measure_button.setEnabled(False)
+        self._measure_proc = QProcess(self)
+        self._measure_proc.finished.connect(self._measure_finished)
+        self._measure_proc.start(str(SCRIPT), ["--status", "--json"])
+        QTimer.singleShot(20000, self._measure_timeout)
+
+    def _measure_timeout(self) -> None:
+        if self._measure_proc is not None and self._measure_proc.state() != QProcess.NotRunning:
+            self._measure_proc.kill()
+            self.measure_button.setEnabled(True)
+
+    def _measure_finished(self, code: int, _status) -> None:
+        self.measure_button.setEnabled(True)
+        proc = self._measure_proc
+        if proc is None:
+            return
+        raw = bytes(proc.readAllStandardOutput()).decode(errors="replace").strip()
+        try:
+            data = json.loads(raw or "{}")
+        except ValueError:
+            data = {}
+        if data.get("error"):
+            QMessageBox.warning(self, "Misura non riuscita", data["error"])
+        elif data.get("light") is None:
+            QMessageBox.warning(self, "Misura non riuscita", "nessun dato ricevuto")
+        self._poll()
+
+    def _reset_calibration(self) -> None:
+        subprocess.run([str(SCRIPT), "--reset"], capture_output=True, timeout=10)
+        self.updated_value.setText("calibrazione azzerata")
+
+    # ------------------------------------------------------------ aggiornamento
+
+    def _sync_labels(self) -> None:
+        self.base_label.setText(f"{self.base_slider.value()}%")
+        self.reduction_label.setText(f"-{self.reduction_slider.value()}%")
+
+    def _poll(self) -> None:
+        state = load_state()
+        light = state.get("light")
+        if light is not None:
+            self.light_value.setText(f"{light:.1f}")
+            target = state.get("pct")
+            if target is not None:
+                self.target_value.setText(f"{target:.0f}%")
+
+        applied = state.get("applied")
+        if applied is not None:
+            self.current_value.setText(f"{applied:.0f}%")
+
+        stamp = state.get("time")
+        if stamp:
+            age = int(time.time() - stamp)
+            if age < 60:
+                text = f"ultimo campionamento: {age} s fa"
+            elif age < 3600:
+                text = f"ultimo campionamento: {age // 60} min fa"
+            else:
+                text = f"ultimo campionamento: {age // 3600} h fa"
+            if daemon_pid() is None:
+                text += "  (automatico spento)"
+            self.updated_value.setText(text)
+        else:
+            self.updated_value.setText("nessun campionamento")
+
+        self._sync_active()
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("webcam-als-settings")
+    app.setDesktopFileName("webcam-als-settings")
+    app.setWindowIcon(QIcon.fromTheme("video-display"))
+    if "Breeze" in QStyleFactory.keys():
+        app.setStyle("Breeze")
+
+    window = App()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Luminosità automatica (webcam)
+Comment=Regola la luminosità dello schermo in base alla luce ambientale stimata dalla webcam
+Exec=@BIN@/webcam-als-settings
+Icon=video-display
+Terminal=false
+Categories=Settings;
+Keywords=brightness;luminosità;webcam;schermo;
+StartupWMClass=webcam-als-settings
